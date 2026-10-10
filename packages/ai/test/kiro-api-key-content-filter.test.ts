@@ -1855,8 +1855,8 @@ describe("Completion event handling (probepark fix for #6451)", () => {
 
 		globalThis.fetch = (async () => {
 			// Incomplete outer frame: stopReason complete but usage object starts but never closes
-			const incompleteFrame = JSON.stringify({ stopReason: "COMPLETED" }).slice(0, -1) + 
-				',"usage":{"inputTokens":100'; // Incomplete, never closes
+			const incompleteFrame =
+				JSON.stringify({ stopReason: "COMPLETED" }).slice(0, -1) + ',"usage":{"inputTokens":100'; // Incomplete, never closes
 
 			const body = new ReadableStream<Uint8Array>({
 				pull(controller) {
