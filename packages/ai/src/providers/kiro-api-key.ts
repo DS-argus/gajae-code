@@ -498,10 +498,38 @@ export function parseKiroApiEvents(buffer: string): { events: KiroStreamEvent[];
 		const end = findJsonEnd(buffer, start);
 		if (end < 0) {
 			// Unclosed brace at 'start'. Could be incomplete JSON waiting for more data, or junk/corruption.
-			// Finding #3: Do NOT resync into nested objects that might be part of the outer incomplete frame.
-			// Keep the incomplete frame as remainder for the next parse call or EOF error handling.
+			// Resync by looking for valid JSON objects within MAX_RESCAN_DISTANCE that parse successfully.
 			const strayBraceEnd = Math.min(start + MAX_RESCAN_DISTANCE, buffer.length);
-			return { events, remaining: buffer.slice(start, strayBraceEnd) };
+			let resyncPos = start + 1;
+			let found = false;
+			while (resyncPos < strayBraceEnd) {
+				const nextStart = buffer.indexOf("{", resyncPos);
+				if (nextStart < 0) break;
+
+				// Try to find the end of this candidate
+				const nextEnd = findJsonEnd(buffer, nextStart);
+				if (nextEnd >= 0) {
+					// Found a candidate that closes. Try to parse it as valid JSON.
+					try {
+						const candidate = buffer.slice(nextStart, nextEnd + 1);
+						JSON.parse(candidate);
+						// Valid JSON found. Resync to this position and continue processing.
+						pos = nextStart;
+						found = true;
+						break;
+					} catch {
+						// Not valid JSON, keep looking
+					}
+				}
+				resyncPos = nextStart + 1;
+			}
+			if (!found) {
+				// No valid JSON found within MAX_RESCAN_DISTANCE. Retain the stray brace and data up to the cap
+				// for the next parse call. Enforce the MAX_RESCAN_DISTANCE cap to prevent unbounded buffering.
+				return { events, remaining: buffer.slice(start, strayBraceEnd) };
+			}
+			// Loop will continue with the resynced pos
+			continue;
 		}
 
 		let parsed: Record<string, unknown> | undefined;
@@ -863,7 +891,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			}
 			if (!response.body) throw new Error("Kiro API key response has no body");
 
-			stream.push({ type: "start", partial: output });
+			// Create a snapshot of output for the start event to prevent text block mutations from affecting it
+			const startPartial = {
+				...output,
+				content: [...output.content], // Shallow copy of content array
+			};
+			stream.push({ type: "start", partial: startPartial });
 			const reader = response.body.getReader();
 			const decoder = new TextDecoder();
 			let buffer = "";
@@ -957,21 +990,21 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const commitPendingText = () => {
 				if (textContentConfirmed || pendingTextContent.length === 0) return; // Already committed or no text
 				textContentConfirmed = true;
-				if (textIndex !== undefined && textIndex < blocks.length) {
-					// Populate the text block that was created with empty text
-					const block = blocks[textIndex] as TextContent;
-					block.text = pendingTextContent;
-				}
+				// Note: we don't populate block.text here to avoid it appearing in previously emitted events
+				// The text will be populated after text_start is emitted in emitDeferredTextEvents
 			};
 
 			// Emit deferred text events if text_start was not yet sent
 			const emitDeferredTextEvents = () => {
 				if (textStartDeferred && textIndex !== undefined && textIndex < blocks.length) {
 					const block = blocks[textIndex];
-					if (block && block.type === "text" && block.text.length > 0) {
-						// Emit deferred text_start
+					// Only emit text events if we have pending text content and it's been confirmed
+					if (block && block.type === "text" && pendingTextContent.length > 0 && textContentConfirmed) {
+						// Emit text_start WITHOUT populating block.text yet
+						// This ensures previously emitted events (like start) see the block as empty
 						stream.push({ type: "text_start", contentIndex: textIndex, partial: output });
-						// Emit all pending text_delta events
+						// Emit all pending text_delta events WITHOUT populating block.text yet
+						// (The text will be populated later when text_end is emitted or at EOF)
 						for (const evt of pendingTextEvents) {
 							if (evt.type === "delta" && evt.delta) {
 								stream.push({
@@ -991,6 +1024,10 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const closeTextBlock = () => {
 				if (textIndex !== undefined && textContentConfirmed) {
 					const block = blocks[textIndex] as TextContent;
+					// Ensure text is populated before emitting text_end
+					if (block.text.length === 0 && pendingTextContent.length > 0) {
+						block.text = pendingTextContent;
+					}
 					stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
 					textIndex = undefined;
 				}
@@ -1154,17 +1191,17 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							stopReason?: string;
 							stopDetails?: { refusal?: { category?: string; explanation?: string } };
 						};
-						if (refusalData.stopDetails?.refusal) {
-							// Handle refusal: clear pending content and emit error (don't emit any text/tool that came before)
-							consumeContent(""); // Flush any pending thinking
+						if (refusalData.stopDetails?.refusal || refusalData.stopReason === "CONTENT_FILTERED") {
+						// Handle refusal: clear pending content and emit error (don't emit any text/tool that came before)
+						consumeContent(""); // Flush any pending thinking
 							clearPendingToolCalls(); // DROP any pending tool call without emitting events
 							// Clear pending text (it was never committed to blocks, so it's safe to discard)
 							pendingTextContent = "";
 							pendingTextEvents.length = 0;
 
-							const refusal = refusalData.stopDetails.refusal;
-							const category = refusal.category;
-							const explanation = refusal.explanation?.trim();
+							const refusal = refusalData.stopDetails?.refusal;
+							const category = refusal?.category;
+							const explanation = refusal?.explanation?.trim();
 							const label = category ? `Kiro refused the request (${category})` : "Kiro refused the request";
 
 							output.stopReason = "error";
@@ -1194,7 +1231,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 
 							output.duration = Date.now() - startTime;
 							if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-							stream.push({ type: "error", reason: "error", error: output });
+							stream.push({ type: "error", reason: "error", error: output, partial: output });
 							stream.end();
 							return;
 						}
@@ -1238,6 +1275,20 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 						if (toolComplete) addToolToBlocks();
 						emitPendingToolCalls();
 
+						// Remove unconfirmed text blocks from the error event
+						if (!textContentConfirmed && textIndex !== undefined) {
+							// Remove the unconfirmed text block from blocks
+							blocks.splice(textIndex, 1);
+							// Update indices of blocks after the removed one
+							for (let i = textIndex; i < blocks.length; i++) {
+								const block = blocks[i] as Block;
+								if (block && typeof block === "object" && "index" in block) {
+									block.index = i;
+								}
+							}
+							textIndex = undefined;
+						}
+					
 						// Preserve text in the error context only if confirmed (text is confirmed safe only after completion or usage event)
 						const accumulatedText = textContentConfirmed
 							? blocks
@@ -1279,7 +1330,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 				output.errorMessage = "Kiro API key stream returned no tokens";
 				output.duration = Date.now() - startTime;
 				if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-				stream.push({ type: "error", reason: "error", error: output });
+				stream.push({ type: "error", reason: "error", error: output, partial: output });
 				stream.end();
 				return;
 			}
@@ -1356,11 +1407,25 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			}
 			pendingToolCalls.length = 0;
 
+			// Remove unconfirmed text blocks from the error event
+			if (!textContentConfirmed && textIndex !== undefined) {
+				// Remove the unconfirmed text block from blocks
+				blocks.splice(textIndex, 1);
+				// Update indices of blocks after the removed one
+				for (let i = textIndex; i < blocks.length; i++) {
+					const block = blocks[i] as Block;
+					if (block && typeof block === "object" && "index" in block) {
+						block.index = i;
+					}
+				}
+				textIndex = undefined;
+			}
+
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = sanitizeKiroError(error, apiKey);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "error", reason: output.stopReason, error: output });
+			stream.push({ type: "error", reason: output.stopReason, error: output, partial: output });
 			stream.end();
 		}
 	})().catch(() => {
