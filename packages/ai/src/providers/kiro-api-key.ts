@@ -1192,8 +1192,8 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							stopDetails?: { refusal?: { category?: string; explanation?: string } };
 						};
 						if (refusalData.stopDetails?.refusal || refusalData.stopReason === "CONTENT_FILTERED") {
-						// Handle refusal: clear pending content and emit error (don't emit any text/tool that came before)
-						consumeContent(""); // Flush any pending thinking
+							// Handle refusal: clear pending content and emit error (don't emit any text/tool that came before)
+							consumeContent(""); // Flush any pending thinking
 							clearPendingToolCalls(); // DROP any pending tool call without emitting events
 							// Clear pending text (it was never committed to blocks, so it's safe to discard)
 							pendingTextContent = "";
@@ -1265,7 +1265,12 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 										}
 									}
 									// Finding #4: Emit text_end for confirmed text before error
-									stream.push({ type: "text_end", contentIndex: textIndex, content: block.text, partial: output });
+									stream.push({
+										type: "text_end",
+										contentIndex: textIndex,
+										content: block.text,
+										partial: output,
+									});
 								}
 								textStartDeferred = false;
 							}
@@ -1288,7 +1293,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 							}
 							textIndex = undefined;
 						}
-					
+
 						// Preserve text in the error context only if confirmed (text is confirmed safe only after completion or usage event)
 						const accumulatedText = textContentConfirmed
 							? blocks
